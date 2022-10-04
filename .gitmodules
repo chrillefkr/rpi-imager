@@ -1,0 +1,3 @@
+[submodule "image-specs"]
+	path = image-specs
+	url = https://salsa.debian.org/raspi-team/image-specs.git
