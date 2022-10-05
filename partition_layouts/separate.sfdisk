@@ -1,0 +1,8 @@
+label: dos
+unit: sectors
+
+/boot/firmware : name=test, size=200MiB, type=c, bootable
+/ : size=1000MiB, type=L
+/home : size=300MiB, type=L
+/var : type=L
+

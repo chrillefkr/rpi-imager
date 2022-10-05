@@ -11,11 +11,13 @@ MIRROR="${MIRROR:-$snapshot_mirror}"
 
 skip_debootstrap="${skip_debootstrap:-no}"
 
-image_file="./pimox.img"
-image_file_real="$( realpath "$image_file" )"
+IMAGE_FILE="${IMAGE_FILE:-./rpi4_debian.img}"
+image_file_real="$( realpath "$IMAGE_FILE" )"
 
-boot_label="RASPIFIRM"
-root_label="RASPIROOT"
+
+PARTITION_LAYOUT="${PARTITION_LAYOUT:-default}"
+partition_layout_dir="$( realpath ./partition_layouts)"
+partition_layout_prefix="${partition_layout_dir}/${PARTITION_LAYOUT}"
 
 packages=(
     ca-certificates
@@ -29,6 +31,7 @@ packages=(
     raspi-firmware
     firmware-brcm80211
 )
+
 
 trap 'echo Finished cleaning up' EXIT
 
@@ -52,64 +55,115 @@ trap_add() {
     done
 }
 
+SKIP_PARTITIONING="${SKIP_PARTITIONING:-no}"
 
-qemu-img create -f raw "$image_file_real" 2048M
+if [ "x$SKIP_PARTITIONING" != "xyes" ]; then
 
-sudo parted -s "$image_file_real" mklabel msdos
+    log "Creating image file:" "$image_file_real"
 
-sudo parted -s "$image_file_real" -- mkpart primary fat32 4MiB 20%
+    qemu-img create -f raw "$image_file_real" 2048M
 
-sudo parted -s "$image_file_real" -- mkpart primary ext2 20% 100%
+    log "Writing partition table"
+    sudo sfdisk "$image_file_real" < "${partition_layout_dir}/${PARTITION_LAYOUT}.sfdisk"
 
-#sudo kpartx -asv "$image_file" 2>&1
-#trap_add 'sudo kpartx -d "$image_file";' EXIT
+fi
+
+log "Mounting image file (and partitions)"
 sudo losetup --show -Pf "$image_file_real"
 
 blockdev="$( sudo losetup -j "$image_file_real" | cut -d':' -f1 | head -n1 )"
-trap_add 'sudo losetup -d "$blockdev";' EXIT
+trap_add "sudo losetup -vd \"$blockdev\";" EXIT
 
 if [ -z "$blockdev" ]; then
     echo "Couldn't find block device. Exiting"
     exit
 fi
 
-#readarray partitions < <(sudo kpartx -r "$image_file" | cut -d' ' -f1) &>/dev/null
 readarray -t partitions < <(sudo lsblk "$blockdev" -o path | tail -n +3) &>/dev/null
 
+SKIP_FORMATTING="${SKIP_FORMATTING:-no}"
 
-#echo "${partitions[@]}"
-#echo "part1: ${partitions[0]};"
-#echo "part2: ${partitions[1]};"
+if [ "x$SKIP_FORMATTING" != "xyes" ]; then
 
-bootdev="${partitions[0]}"
-rootdev="${partitions[1]}"
+    log "Formating partitions"
+    while read -r mountpoint partnum fs label; do
+        partition="${partitions[$partnum]}"
+        if [ "$fs" == "vfat" ]; then
+            if [ -z "$label" ]; then
+                sudo mkfs -t vfat "$partition"
+            else
+                sudo mkfs -t vfat -n "$label" "$partition"
+            fi
+        elif [ "$fs" == "ext4" ]; then
+            if [ -z "$label" ]; then
+                sudo mkfs -F -t ext4 "$partition"
+            else
+                sudo mkfs -F -t ext4 -L "$label" "$partition"
+            fi
+        elif [ "$fs" == "swap" ]; then
+            if [ -z "$label" ]; then
+                sudo mkswap "$partition"
+            else
+                sudo mkswap -L "$label" "$partition"
+            fi
+        else
+            fatal "Filesystem type $fs not yet supported :)"
+        fi
+    done < <( grep -vE '^\s*#.*$|^$' "${partition_layout_dir}/${PARTITION_LAYOUT}.fs" )
+fi
 
-sudo /sbin/mkfs -t vfat -n RASPIFIRM "${bootdev}"
-sudo /sbin/mkfs -F -t ext4 -L RASPIROOT "${rootdev}"
-
+log "Creating root mountpoint"
 root_mountpoint="$( mktemp -d )"
-boot_mountpoint="${root_mountpoint}/boot/firmware"
 trap_add "rmdir -v \"$root_mountpoint\";" EXIT
 
-sudo mount "$rootdev" "${root_mountpoint}"
-trap_add 'sudo umount "${root_mountpoint}"' EXIT
+mountpoints=()
 
-sudo mkdir -p "${boot_mountpoint}"
+log "Mounting filesystems at:" "$root_mountpoint"
+while read -r mountpoint partnum fs label; do
+    partition="${partitions[$partnum]}"
+    real_mountpoint="${root_mountpoint}/${mountpoint}"
 
-sudo mount "$bootdev" "${boot_mountpoint}"
-trap_add 'sudo umount "${boot_mountpoint}"' EXIT
+    sudo mkdir -p "${real_mountpoint}"
+    sudo mount -v "$partition" "${real_mountpoint}"
+    trap_add "sudo umount -vrf \"${real_mountpoint}\"" EXIT
+    mountpoints+=("${real_mountpoint}")
+done < <( grep -vE '^\s*#.*$|^$' "${partition_layout_dir}/${PARTITION_LAYOUT}.fs" )
+
+
+log "Mounting bind mounts (dev, proc, etc)"
+while read -r p; do
+    mp="${root_mountpoint}${p}"
+    sudo mkdir -vp "$mp"
+    sudo mount --bind "$p" "$mp"
+    trap_add "sudo umount -vrf \"${mp}\"" EXIT
+done <<EOF
+/dev
+/dev/pts
+/proc
+/tmp
+EOF
+
 
 mkdir -p "$debootstrap_fs_cache_path"
 
 if [ "x$skip_debootstrap" != "xyes" ]; then
     sudo mkdir -p "$debootstrap_deb_cache_path"
+    sudo rm -rf "${debootstrap_fs_cache_path}"
+    mkdir -p "$debootstrap_fs_cache_path"
     sudo chown root: "$debootstrap_fs_cache_path"
+    log "Running debootstrap"
     sudo debootstrap --cache-dir "$debootstrap_deb_cache_path" --arch arm64 --variant -  --components main,contrib,non-free bullseye "$debootstrap_fs_cache_path" "$MIRROR"
 fi
 
-sudo cp -a "$debootstrap_fs_cache_path/." "$root_mountpoint/"
+SKIP_FS_COPY="${SKIP_FS_COPY:-no}"
+
+if [ "x$SKIP_FS_COPY" != "xyes" ]; then
+    log "Copying debootstrap fs cache to disk"
+    sudo cp -a "$debootstrap_fs_cache_path/." "$root_mountpoint/"
+fi
 
 
+log "Setting /etc/apt/sources.list"
 cat <<EOF | sudo tee "${root_mountpoint}/etc/apt/sources.list" >/dev/null
 deb http://deb.debian.org/debian bullseye main contrib non-free
 deb http://security.debian.org/debian-security bullseye-security main contrib non-free
@@ -118,50 +172,36 @@ deb http://security.debian.org/debian-security bullseye-security main contrib no
 # deb http://deb.debian.org/debian bullseye-backports main contrib non-free
 EOF
 
-function rootfs_copy {
-    file="$1"
-    perm="${2:-0755}"
-    dest="${root_mountpoint}/$file"
-    dest_dir="$( dirname "$dest" )"
-    sudo mkdir -p "$dest_dir"
-    sudo cp -av "image-specs/image-specs/rootfs/$file" "$dest"
-    chmod "$perm" "$dest"
-}
-
 function chroot_run {
     sudo chroot "$root_mountpoint" $@
 }
 
+log "Installing packages"
+chroot_run apt-get update -y
+chroot_run apt-get install -y ${packages[@]}
 
-#cp -av image-specs/image-specs/rootfs/etc/initramfs-tools/hooks/rpi-resizerootfs "${root_mountpoint}"
-rootfs_copy /etc/initramfs-tools/hooks/rpi-resizerootfs
-rootfs_copy /etc/initramfs-tools/scripts/local-bottom/rpi-resizerootfs
+log "Finalizing installation"
 
-chroot_run apt-get update
-chroot_run apt-get install ${packages[@]}
+#install -m 644 -o root -g root image-specs/rootfs/etc/fstab "${root_mountpoint}/etc/fstab"
 
-install -m 644 -o root -g root image-specs/rootfs/etc/fstab "${root_mountpoint}/etc/fstab"
+sudo install -m 644 -o root -g root "${partition_layout_prefix}.fstab" "${root_mountpoint}/etc/fstab"
 
-install -m 644 -o root -g root image-specs/rootfs/etc/network/interfaces.d/eth0 "${root_mountpoint}/etc/network/interfaces.d/eth0"
-install -m 600 -o root -g root image-specs/rootfs/etc/network/interfaces.d/wlan0 "${root_mountpoint}/etc/network/interfaces.d/wlan0"
+sudo install -m 644 -o root -g root image-specs/rootfs/etc/network/interfaces.d/eth0 "${root_mountpoint}/etc/network/interfaces.d/eth0"
+sudo install -m 600 -o root -g root image-specs/rootfs/etc/network/interfaces.d/wlan0 "${root_mountpoint}/etc/network/interfaces.d/wlan0"
 
-install -m 755 -o root -g root image-specs/rootfs/usr/local/sbin/rpi-set-sysconf "${root_mountpoint}/usr/local/sbin/rpi-set-sysconf"
-install -m 644 -o root -g root image-specs/rootfs/etc/systemd/system/rpi-set-sysconf.service "${root_mountpoint}/etc/systemd/system/"
-install -m 644 -o root -g root image-specs/rootfs/boot/firmware/sysconf.txt "${root_mountpoint}/boot/firmware/sysconf.txt"
-mkdir -p "${root_mountpoint}/etc/systemd/system/basic.target.requires/"
-ln -s /etc/systemd/system/rpi-set-sysconf.service "${root_mountpoint}/etc/systemd/system/basic.target.requires/rpi-set-sysconf.service"
+sudo install -m 755 -o root -g root image-specs/rootfs/usr/local/sbin/rpi-set-sysconf "${root_mountpoint}/usr/local/sbin/rpi-set-sysconf"
+sudo install -m 644 -o root -g root image-specs/rootfs/etc/systemd/system/rpi-set-sysconf.service "${root_mountpoint}/etc/systemd/system/"
+sudo install -m 644 -o root -g root image-specs/rootfs/boot/firmware/sysconf.txt "${root_mountpoint}/boot/firmware/sysconf.txt"
+sudo mkdir -p "${root_mountpoint}/etc/systemd/system/basic.target.requires/"
+sudo ln -s /etc/systemd/system/rpi-set-sysconf.service "${root_mountpoint}/etc/systemd/system/basic.target.requires/rpi-set-sysconf.service"
 
-# Resize script is now in the initrd for first boot; no need to ship it.
-rm -f "${root_mountpoint}/etc/initramfs-tools/hooks/rpi-resizerootfs"
-rm -f "${root_mountpoint}/etc/initramfs-tools/scripts/local-bottom/rpi-resizerootfs"
+sudo install -m 644 -o root -g root image-specs/rootfs/etc/systemd/system/rpi-reconfigure-raspi-firmware.service "${root_mountpoint}/etc/systemd/system/"
+sudo mkdir -p "${root_mountpoint}/etc/systemd/system/multi-user.target.requires/"
+sudo ln -s /etc/systemd/system/rpi-reconfigure-raspi-firmware.service "${root_mountpoint}/etc/systemd/system/multi-user.target.requires/rpi-reconfigure-raspi-firmware.service"
 
-install -m 644 -o root -g root image-specs/rootfs/etc/systemd/system/rpi-reconfigure-raspi-firmware.service "${root_mountpoint}/etc/systemd/system/"
-mkdir -p "${root_mountpoint}/etc/systemd/system/multi-user.target.requires/"
-ln -s /etc/systemd/system/rpi-reconfigure-raspi-firmware.service "${root_mountpoint}/etc/systemd/system/multi-user.target.requires/rpi-reconfigure-raspi-firmware.service"
-
-install -m 644 -o root -g root image-specs/rootfs/etc/systemd/system/rpi-generate-ssh-host-keys.service "${root_mountpoint}/etc/systemd/system/"
-ln -s /etc/systemd/system/rpi-generate-ssh-host-keys.service "${root_mountpoint}/etc/systemd/system/multi-user.target.requires/rpi-generate-ssh-host-keys.service"
-rm -f "${root_mountpoint}"/etc/ssh/ssh_host_*_key*
+sudo install -m 644 -o root -g root image-specs/rootfs/etc/systemd/system/rpi-generate-ssh-host-keys.service "${root_mountpoint}/etc/systemd/system/"
+sudo ln -s /etc/systemd/system/rpi-generate-ssh-host-keys.service "${root_mountpoint}/etc/systemd/system/multi-user.target.requires/rpi-generate-ssh-host-keys.service"
+sudo rm -f "${root_mountpoint}"/etc/ssh/ssh_host_*_key*
 
 
 chroot_run install -m 644 -o root -g root /usr/lib/linux-image-*-arm64/broadcom/bcm*rpi*.dtb /boot/firmware/
@@ -180,7 +220,26 @@ chroot_run rm "${ROOT?}/etc/resolv.conf"
 chroot_run rm -f /etc/machine-id /var/lib/dbus/machine-id
 
 
-echo "Now exiting"
+log "Cleaning up image file"
+
+for mountpoint in "${mountpoints[@]}"; do
+    sudo umount -vrf "$mountpoint"
+done
+
+RUN_DEFRAG="${RUN_DEFRAG:-yes}"
+if [ "z$RUN_DEFRAG" == "xyes" ]; then
+    for partition in "${partitions[@]}"; do
+        sudo e4defrag -v "$partition" || true
+    done
+fi
+
+RUN_ZEROFREE="${RUN_ZEROFREE:-yes}"
+if [ "z$RUN_ZEROFREE" == "xyes" ]; then
+    for partition in "${partitions[@]}"; do
+        sudo zerofree -v "$partition" || true
+    done
+fi
+
 
 exit
 

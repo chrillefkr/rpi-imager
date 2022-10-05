@@ -1,0 +1,6 @@
+label: dos
+unit: sectors
+
+/boot/firmware : name=test, size=200MiB, type=c, bootable
+/ : type=L
+
